@@ -1,4 +1,7 @@
 test_data
+*.o
+*.so
+*.pkl
 
 results
 checkpoints/*

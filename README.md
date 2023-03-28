@@ -44,9 +44,7 @@ Contact-GraspNet can directly predict a 6-DoF grasp distribution from a raw scen
 Given a .npy/.npz file with a depth map (in meters), camera matrix K and (optionally) a 2D segmentation map, execute:
 
 ```shell
-python contact_graspnet/inference.py \
-       --np_path=test_data/*.npy \
-       --local_regions --filter_grasps
+python contact_graspnet/inference.py --np_path=test_data/*.npy --local_regions --filter_grasps
 ```
 
 <p align="center">

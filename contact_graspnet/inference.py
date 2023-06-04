@@ -9,7 +9,12 @@ import cv2
 import tensorflow.compat.v1 as tf
 tf.disable_eager_execution()
 physical_devices = tf.config.experimental.list_physical_devices('GPU')
-tf.config.experimental.set_memory_growth(physical_devices[0], True)
+# tf.config.experimental.set_memory_growth(physical_devices[0], True)
+# Fix error "ValueError: Memory growth cannot differ between GPU devices" when calling inference
+# Reference: https://github.com/theAIGuysCode/yolov4-deepsort/pull/89#issue-950698392 ; 
+if len(physical_devices) > 0:
+    tf.config.experimental.set_visible_devices(physical_devices[0], 'GPU')
+    tf.config.experimental.set_memory_growth(physical_devices[0], True)
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(BASE_DIR))
@@ -73,8 +78,8 @@ def inference(global_config, checkpoint_dir, input_paths, K=None, local_regions=
                                                                                           local_regions=local_regions, filter_grasps=filter_grasps, forward_passes=forward_passes)  
 
         # Save results
-        np.savez('results/predictions_{}'.format(os.path.basename(p.replace('png','npz').replace('npy','npz'))), 
-                  pred_grasps_cam=pred_grasps_cam, scores=scores, contact_pts=contact_pts)
+        # np.savez('./results/predictions_{}'.format(os.path.basename(p.replace('png','npz').replace('npy','npz'))), 
+        #           pred_grasps_cam=pred_grasps_cam, scores=scores, contact_pts=contact_pts)
 
         # Visualize results          
         show_image(rgb, segmap)

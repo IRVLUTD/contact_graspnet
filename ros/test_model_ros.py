@@ -122,19 +122,18 @@ class PointToGraspPubSub:
         self.filter_grasps = filter_grasps
         self.forward_passes = forward_passes
 
-        self.points_cam = None
+        self.points_cam = None # Object PC in camera frame
         self.points_cent = None
+        self.pc_all_cam = None # Entire Scene PC in camera frame
         self.frame_stamp = None
         self.frame_id = None
         self.base_frame = "base_link"
-        self.SCALING_FACTOR = 0.8
+        self.SCALING_FACTOR = 1.0
         self.prev_step = None
         self.step = 0  # indicator for whether a new pc is registered
         # Create the transform the aligns Fetch with Panda Grasp
         # Apply the generated grasp pose on this transform to get pose for Fetch Gripper
         # i.e pose_fetch = pose_panda @ transform
-        # _quat_tf = [0, -0.7071068, 0, 0.7071068]
-        # _tran_tf = [0, 0, -0.08]
         _quat_tf = [0.5, -0.5, 0.5, 0.5]
         _tran_tf = [0, 0, -0.1]
         self._transform_grasp = ros_qt_to_rt(_quat_tf, _tran_tf)
@@ -145,29 +144,52 @@ class PointToGraspPubSub:
         point_sub = message_filters.Subscriber(
             "/selected_objpts", PointCloud, queue_size=5
         )
+        pc_all_sub = message_filters.Subscriber(
+            "/all_objpts_cam", PointCloud, queue_size=5
+        )
         queue_size = 1
         slop_seconds = 0.1
         ts = message_filters.ApproximateTimeSynchronizer(
-            [point_sub], queue_size, slop_seconds
+            [point_sub, pc_all_sub], queue_size, slop_seconds
         )
         ts.registerCallback(self.callback_points)
 
-    def callback_points(self, points_pc):
-        pc_header = points_pc.header
+    def callback_points(self, obj_pc_cam, scene_pc_cam):
+        pc_header = obj_pc_cam.header
         pc_frame_id = pc_header.frame_id
         pc_frame_stamp = pc_header.stamp
-        n = len(points_pc.points)
+        print("[CALLBACK] Received point cloud messages!!")
+
+        n = len(obj_pc_cam.points)
         assert n > 0
         points_cam = np.zeros((n, 3))
-        for i, objpt in enumerate(points_pc.points):
+        for i, objpt in enumerate(obj_pc_cam.points):
             points_cam[i, :] = [objpt.x, objpt.y, objpt.z]
         points_cent = np.mean(points_cam, axis=0)
+        print("[CALLBACK] Saved object points...")
+
+        m = len(scene_pc_cam.points)
+        assert m > 0
+        scene_points = np.zeros((m, 3))
+        for j, sc_pt in enumerate(scene_pc_cam.points):
+            scene_points[j, :] = [sc_pt.x, sc_pt.y, sc_pt.z]
+        print("[CALLBACK] Saved scene points...")
+
         # with lock:
         self.points_cam = points_cam.copy()
+        self.pc_all_cam = scene_points
+        print(f"[CALLBACK] self.pc_all_cam shape : {self.pc_all_cam.shape}")
         self.points_cent = points_cent.copy()
         self.frame_id = pc_frame_id
         self.frame_stamp = pc_frame_stamp
         self.step += 1
+
+    def _scale(self, points, scale=1.0):
+        center = np.mean(points, axis=0)
+        points -= center
+        points *= scale
+        points += center
+        return points, center
 
     def run_network(self, viz=False):
         # with lock:
@@ -180,11 +202,12 @@ class PointToGraspPubSub:
         self.prev_step = self.step
 
         points_cam = self.points_cam.copy()
+        pc_all_cam = self.pc_all_cam.copy()
         frame_id = self.frame_id
         frame_stamp = self.frame_stamp
         print("\n=================================================================")
         # run the network
-
+        print("[LISTENER] Running network...")
         print("[LISTENER] Scaling Input Points")
         # Scale the points using scaling factor before passing through the network
         center = np.mean(points_cam, axis=0)
@@ -194,15 +217,16 @@ class PointToGraspPubSub:
         print("[LISTENER] Filtering point cloud based on Z range")
         # Process the input pc as an appropriate input to the network. For our use case,
         # pc_full and pc_segments are same as we supply a single object's segmented pc.
-        pc_full = points_cam.copy()
-        pc_full = pc_full[
-            (pc_full[:, 2] < self.z_range[1]) & (pc_full[:, 2] > self.z_range[0])
-        ]
+        pc_full = pc_all_cam.copy()
+        # pc_full = pc_full[
+        #     (pc_full[:, 2] < self.z_range[1]) & (pc_full[:, 2] > self.z_range[0])
+        # ]
         # By default, we set the keyfor pc_segment to be 0
         # The network outputs a dict with keys as the mask ids for a specific instance
         # We simply recover the recover the grasps using the dummy key we set before (INSTANCE_KEY)
         INSTANCE_KEY = 0  # some dummy key
-        pc_segments = {INSTANCE_KEY: pc_full.copy()}
+        pc_segments = {INSTANCE_KEY: points_cam.copy()}
+
         print("[LISTENER] Predicting Grasps....")
         gen_grasps_d, gen_scores_d, _, _ = self.estimator.predict_scene_grasps(
             self.sess,

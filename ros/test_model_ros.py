@@ -176,7 +176,6 @@ class PointToGraspPubSub:
 
         if self.prev_step == self.step:
             # Point cloud is not updated yet!
-            print()
             return
         self.prev_step = self.step
 
@@ -215,8 +214,10 @@ class PointToGraspPubSub:
         )
         print(f"[LISTENER] GEN GRASPS KEYS: {gen_grasps_d.keys()}")
         print(f"[LISTENER] GEN GRASPS SCORES: {gen_scores_d.keys()}")
-        gen_grasps, gen_scores = gen_grasps_d[INSTANCE_KEY], gen_scores_d[INSTANCE_KEY]
-
+        if -1 in gen_grasps_d.keys():
+            gen_grasps, gen_scores = gen_grasps_d[-1], gen_scores_d[-1]
+        else:
+            gen_grasps, gen_scores = gen_grasps_d[INSTANCE_KEY], gen_scores_d[INSTANCE_KEY]
         print("[LISTENER] Sorting and Transforming Grasps....")
         # Invert the scaling for the translation part of grasp pose ; Rotation is not afffected
         gg = []

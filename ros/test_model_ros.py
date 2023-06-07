@@ -154,11 +154,10 @@ class PointToGraspPubSub:
 
         self.camera_frame = 'head_camera_rgb_optical_frame'
         self.target_frame = self.base_frame  
-
+        
         self.tf_buffer = tf2_ros.Buffer(rospy.Duration(100.0))  # tf buffer length    
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
 
-
+        msg = rospy.wait_for_message('/head_camera/rgb/camera_info', CameraInfo)
         # update camera intrinsics
         intrinsics = np.array(msg.K).reshape(3, 3)
         self.fx = intrinsics[0, 0]
@@ -182,8 +181,6 @@ class PointToGraspPubSub:
         RT[1, 3] = transform.translation.y        
         RT[2, 3] = transform.translation.z
         self.camera_pose = RT
-
-
 
         # initialize a node
         rospy.init_node("pose_contact_graspnet")

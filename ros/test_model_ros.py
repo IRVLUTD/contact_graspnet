@@ -15,6 +15,7 @@ import tf2_ros
 from sensor_msgs.msg import Image, CameraInfo, PointCloud
 from geometry_msgs.msg import Pose, PoseArray, Point
 from cv_bridge import CvBridge, CvBridgeError
+from tf.transformations import quaternion_matrix
 from transforms3d.quaternions import mat2quat, quat2mat
 
 import tensorflow.compat.v1 as tf
@@ -34,6 +35,17 @@ import _init_paths
 from contact_grasp_estimator import GraspEstimator
 from visualization_utils import visualize_grasps
 from config_utils import load_config
+
+lock = threading.Lock()
+
+
+def compute_xyz(depth_img, fx, fy, px, py, height, width):
+    indices = np.indices((height, width), dtype=np.float32).transpose(1, 2, 0)
+    z_e = depth_img
+    x_e = (indices[..., 1] - px) * z_e / fx
+    y_e = (indices[..., 0] - py) * z_e / fy
+    xyz_img = np.stack([x_e, y_e, z_e], axis=-1)  # Shape: [H x W x 3]
+    return xyz_img
 
 
 def rt_to_ros_qt(rt):
@@ -122,9 +134,11 @@ class PointToGraspPubSub:
         self.filter_grasps = filter_grasps
         self.forward_passes = forward_passes
 
+        self.xyz_image = None
         self.points_cam = None # Object PC in camera frame
         self.points_cent = None
         self.pc_all_cam = None # Entire Scene PC in camera frame
+        self.depth = None
         self.frame_stamp = None
         self.frame_id = None
         self.base_frame = "base_link"
@@ -138,51 +152,93 @@ class PointToGraspPubSub:
         _tran_tf = [0, 0, -0.1]
         self._transform_grasp = ros_qt_to_rt(_quat_tf, _tran_tf)
 
+        self.camera_frame = 'head_camera_rgb_optical_frame'
+        self.target_frame = self.base_frame  
+
+        self.tf_buffer = tf2_ros.Buffer(rospy.Duration(100.0))  # tf buffer length    
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+
+
+        # update camera intrinsics
+        intrinsics = np.array(msg.K).reshape(3, 3)
+        self.fx = intrinsics[0, 0]
+        self.fy = intrinsics[1, 1]
+        self.px = intrinsics[0, 2]
+        self.py = intrinsics[1, 2]
+        self.intrinsics = intrinsics
+        print(intrinsics)
+        
+        # camera pose in base
+        transform = self.tf_buffer.lookup_transform(self.base_frame,
+                                           # source frame:
+                                           self.camera_frame,
+                                           # get the tf at the time the pose was valid
+                                           rospy.Time(0),
+                                           # wait for at most 1 second for transform, otherwise throw
+                                           rospy.Duration(1.0)).transform
+        quat = [transform.rotation.x, transform.rotation.y, transform.rotation.z, transform.rotation.w]
+        RT = quaternion_matrix(quat)
+        RT[0, 3] = transform.translation.x
+        RT[1, 3] = transform.translation.y        
+        RT[2, 3] = transform.translation.z
+        self.camera_pose = RT
+
+
+
         # initialize a node
         rospy.init_node("pose_contact_graspnet")
         self.pose_pub = rospy.Publisher("pose_6dof", PoseArray, queue_size=10)
+        depth_sub = message_filters.Subscriber('/head_camera/depth_registered/image_raw', Image, queue_size=10)
         point_sub = message_filters.Subscriber(
             "/selected_objpts", PointCloud, queue_size=5
         )
-        pc_all_sub = message_filters.Subscriber(
-            "/all_objpts_cam", PointCloud, queue_size=5
-        )
+        # pc_all_sub = message_filters.Subscriber(
+        #     "/all_objpts_cam", PointCloud, queue_size=5
+        # )
         queue_size = 1
         slop_seconds = 0.1
         ts = message_filters.ApproximateTimeSynchronizer(
-            [point_sub, pc_all_sub], queue_size, slop_seconds
+            [point_sub, depth_sub], queue_size, slop_seconds
         )
         ts.registerCallback(self.callback_points)
 
-    def callback_points(self, obj_pc_cam, scene_pc_cam):
+    def callback_points(self, obj_pc_cam, depth):
+        if depth.encoding == '32FC1':
+            depth_cv = self.cv_bridge.imgmsg_to_cv2(depth)
+        elif depth.encoding == '16UC1':
+            depth_cv = self.cv_bridge.imgmsg_to_cv2(depth).copy().astype(np.float32)
+            depth_cv /= 1000.0
+        else:
+            rospy.logerr_throttle(
+                1, 'Unsupported depth type. Expected 16UC1 or 32FC1, got {}'.format(
+                    depth.encoding))
+            return
+        
         pc_header = obj_pc_cam.header
         pc_frame_id = pc_header.frame_id
         pc_frame_stamp = pc_header.stamp
         print("[CALLBACK] Received point cloud messages!!")
-
         n = len(obj_pc_cam.points)
         assert n > 0
         points_cam = np.zeros((n, 3))
         for i, objpt in enumerate(obj_pc_cam.points):
             points_cam[i, :] = [objpt.x, objpt.y, objpt.z]
-        points_cent = np.mean(points_cam, axis=0)
         print("[CALLBACK] Saved object points...")
 
-        m = len(scene_pc_cam.points)
-        assert m > 0
-        scene_points = np.zeros((m, 3))
-        for j, sc_pt in enumerate(scene_pc_cam.points):
-            scene_points[j, :] = [sc_pt.x, sc_pt.y, sc_pt.z]
-        print("[CALLBACK] Saved scene points...")
+        # compute xyz image
+        height = depth_cv.shape[0]
+        width = depth_cv.shape[1]
+        xyz_image = compute_xyz(depth_cv, self.fx, self.fy, self.px, self.py, height, width)
 
-        # with lock:
-        self.points_cam = points_cam.copy()
-        self.pc_all_cam = scene_points
-        print(f"[CALLBACK] self.pc_all_cam shape : {self.pc_all_cam.shape}")
-        self.points_cent = points_cent.copy()
-        self.frame_id = pc_frame_id
-        self.frame_stamp = pc_frame_stamp
-        self.step += 1
+        with lock:
+            self.points_cam = points_cam.copy()
+            print(f"[CALLBACK] self.pc_all_cam shape : {self.pc_all_cam.shape}")
+            self.frame_id = pc_frame_id
+            self.frame_stamp = pc_frame_stamp
+            self.xyz_image = xyz_image.copy()
+            self.step += 1
+        
+        self.run_network(viz=False)
 
     def _scale(self, points, scale=1.0):
         center = np.mean(points, axis=0)
@@ -202,7 +258,11 @@ class PointToGraspPubSub:
         self.prev_step = self.step
 
         points_cam = self.points_cam.copy()
-        pc_all_cam = self.pc_all_cam.copy()
+        xyz_img = self.xyz_image.copy()
+        _depth = xyz_img[:, :, 2]
+        pc_all_cam = xyz_img[(_depth > 0) & (_depth < 1.8), :]
+        pc_all_cam = np.reshape(pc_all_cam, (-1, 3))
+
         frame_id = self.frame_id
         frame_stamp = self.frame_stamp
         print("\n=================================================================")
@@ -420,9 +480,10 @@ if __name__ == "__main__":
         sess, grasp_estimator, z_range, local_regions, filter_grasps, forward_passes
     )
     print("[INFO] Starting the Subscribing-Publishing loop ...")
-    while not rospy.is_shutdown():
-        try:
-            listener.run_network(viz_grasps)
-        except KeyboardInterrupt:
-            break
+    # while not rospy.is_shutdown():
+    #     try:
+    #         listener.run_network(viz_grasps)
+    #     except KeyboardInterrupt:
+    #         break
+    rospy.spin()
     print("[INFO] Exiting Contact GraspNet generation ROS Node")

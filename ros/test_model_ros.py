@@ -154,12 +154,10 @@ class PointToGraspPubSub:
 
         self.camera_frame = 'head_camera_rgb_optical_frame'
         self.target_frame = self.base_frame  
-        
-        self.tf_buffer = tf2_ros.Buffer(rospy.Duration(100.0))  # tf buffer length    
+        self.cv_bridge = CvBridge()
 
-        msg = rospy.wait_for_message('/head_camera/rgb/camera_info', CameraInfo)
-        # update camera intrinsics
-        intrinsics = np.array(msg.K).reshape(3, 3)
+        K = [554.254691191187, 0.0, 320.5, 0.0, 554.254691191187, 240.5, 0.0, 0.0, 1.0]
+        intrinsics = np.array(K).reshape(3, 3)
         self.fx = intrinsics[0, 0]
         self.fy = intrinsics[1, 1]
         self.px = intrinsics[0, 2]
@@ -167,37 +165,20 @@ class PointToGraspPubSub:
         self.intrinsics = intrinsics
         print(intrinsics)
         
-        # camera pose in base
-        transform = self.tf_buffer.lookup_transform(self.base_frame,
-                                           # source frame:
-                                           self.camera_frame,
-                                           # get the tf at the time the pose was valid
-                                           rospy.Time(0),
-                                           # wait for at most 1 second for transform, otherwise throw
-                                           rospy.Duration(1.0)).transform
-        quat = [transform.rotation.x, transform.rotation.y, transform.rotation.z, transform.rotation.w]
-        RT = quaternion_matrix(quat)
-        RT[0, 3] = transform.translation.x
-        RT[1, 3] = transform.translation.y        
-        RT[2, 3] = transform.translation.z
-        self.camera_pose = RT
 
         # initialize a node
         rospy.init_node("pose_contact_graspnet")
         self.pose_pub = rospy.Publisher("pose_6dof", PoseArray, queue_size=10)
         depth_sub = message_filters.Subscriber('/head_camera/depth_registered/image_raw', Image, queue_size=10)
-        point_sub = message_filters.Subscriber(
-            "/selected_objpts", PointCloud, queue_size=5
-        )
-        # pc_all_sub = message_filters.Subscriber(
-        #     "/all_objpts_cam", PointCloud, queue_size=5
-        # )
+        point_sub = message_filters.Subscriber("/selected_objpts", PointCloud, queue_size=5)
+        pc_all_sub = message_filters.Subscriber("/all_objpts_cam", PointCloud, queue_size=5)
         queue_size = 1
         slop_seconds = 0.1
         ts = message_filters.ApproximateTimeSynchronizer(
             [point_sub, depth_sub], queue_size, slop_seconds
         )
         ts.registerCallback(self.callback_points)
+
 
     def callback_points(self, obj_pc_cam, depth):
         if depth.encoding == '32FC1':
@@ -210,7 +191,12 @@ class PointToGraspPubSub:
                 1, 'Unsupported depth type. Expected 16UC1 or 32FC1, got {}'.format(
                     depth.encoding))
             return
-        
+
+        # compute xyz image
+        # height = depth_cv.shape[0]
+        # width = depth_cv.shape[1]
+        # xyz_image = compute_xyz(depth_cv, self.fx, self.fy, self.px, self.py, height, width)
+
         pc_header = obj_pc_cam.header
         pc_frame_id = pc_header.frame_id
         pc_frame_stamp = pc_header.stamp
@@ -222,17 +208,12 @@ class PointToGraspPubSub:
             points_cam[i, :] = [objpt.x, objpt.y, objpt.z]
         print("[CALLBACK] Saved object points...")
 
-        # compute xyz image
-        height = depth_cv.shape[0]
-        width = depth_cv.shape[1]
-        xyz_image = compute_xyz(depth_cv, self.fx, self.fy, self.px, self.py, height, width)
-
         with lock:
             self.points_cam = points_cam.copy()
-            print(f"[CALLBACK] self.pc_all_cam shape : {self.pc_all_cam.shape}")
             self.frame_id = pc_frame_id
             self.frame_stamp = pc_frame_stamp
-            self.xyz_image = xyz_image.copy()
+            # self.xyz_image = xyz_image.copy()
+            self.depth_cv = depth_cv.copy()
             self.step += 1
         
         self.run_network(viz=False)
@@ -244,6 +225,7 @@ class PointToGraspPubSub:
         points += center
         return points, center
 
+
     def run_network(self, viz=False):
         # with lock:
         if listener.points_cam is None:
@@ -253,12 +235,23 @@ class PointToGraspPubSub:
             # Point cloud is not updated yet!
             return
         self.prev_step = self.step
-
+        
         points_cam = self.points_cam.copy()
-        xyz_img = self.xyz_image.copy()
+
+        depth_cv = self.depth_cv.copy()
+        height = depth_cv.shape[0]
+        width = depth_cv.shape[1]
+        xyz_img = compute_xyz(depth_cv, self.fx, self.fy, self.px, self.py, height, width)
+       
+        # xyz_img = self.xyz_image.copy()
         _depth = xyz_img[:, :, 2]
         pc_all_cam = xyz_img[(_depth > 0) & (_depth < 1.8), :]
         pc_all_cam = np.reshape(pc_all_cam, (-1, 3))
+        np.save(f"pc_all_cam_{self.step}.npy", pc_all_cam)
+        print(f"PC ALL: {pc_all_cam.shape}")
+        size = min(60000, pc_all_cam.shape[0])
+        pc_all_cam = pc_all_cam[np.random.choice(range(pc_all_cam.shape[0]), size), :]
+        print(f"PC ALL: {pc_all_cam.shape}")
 
         frame_id = self.frame_id
         frame_stamp = self.frame_stamp
@@ -333,29 +326,10 @@ class PointToGraspPubSub:
                 self.pose_pub.publish(parray)
                 rospy.loginfo("[LISTENER] Finished publishing pose array")
                 break
-        if viz:
-            print("[LISTENER] Visualizing generated grasps...")
-            visualize_grasps(pc_full, gen_grasps_d, gen_scores_d)
-            # Panda Gripper
-            # mlab.figure(bgcolor=(1, 1, 1))
-            # draw_scene(
-            #     pc_to_network,
-            #     grasps=gen_grasps,
-            #     grasp_scores=gen_scores,
-            #     # show_gripper_mesh=True,
-            #     # gripper='panda'
-            # )
-            # # Fetch Gripper
-            # # mlab.figure(bgcolor=(1, 1, 1))
-            # # draw_scene(
-            # #     points_viz,
-            # #     pc_color=None,
-            # #     grasps=sorted_graps_fetch,
-            # #     grasp_scores=[gen_scores[i] for i in sort_index],
-            # #     show_gripper_mesh=True,
-            # #     gripper='fetch_real_world'
-            # # )
-            # mlab.show()  # show after publishing
+        # if viz:
+        #     print("[LISTENER] Visualizing generated grasps...")
+        #     visualize_grasps(pc_full, gen_grasps_d, gen_scores_d)
+
         print("[LISTENER] Returning from run_network() call...")
         print("=================================================================\n")
 

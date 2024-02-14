@@ -9,6 +9,7 @@ import numpy as np
 import cv2
 
 import rospy
+import ros_numpy
 import rosnode
 import message_filters
 import tf2_ros
@@ -182,9 +183,9 @@ class PointToGraspPubSub:
 
     def callback_points(self, obj_pc_cam, depth):
         if depth.encoding == '32FC1':
-            depth_cv = self.cv_bridge.imgmsg_to_cv2(depth)
+            depth_cv = ros_numpy.numpify(depth)
         elif depth.encoding == '16UC1':
-            depth_cv = self.cv_bridge.imgmsg_to_cv2(depth).copy().astype(np.float32)
+            depth_cv = ros_numpy.numpify(depth).copy().astype(np.float32)
             depth_cv /= 1000.0
         else:
             rospy.logerr_throttle(
